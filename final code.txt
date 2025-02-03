@@ -1,0 +1,156 @@
+import numpy as np
+import os
+import cv2
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from sklearn.metrics.pairwise import cosine_similarity
+from flask import Flask, request, jsonify, render_template
+from tensorflow.keras.preprocessing import image
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Use environment variables for configuration
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', './uploads')  # Default to './uploads' if not set
+app.config['PORT'] = int(os.getenv('PORT', 8080))  # Default to 8080 if not set
+
+# Load Pre-trained ResNet50 Model for Feature Extraction (for image-based features)
+resnet_model = ResNet50(weights="imagenet", include_top=False, pooling="avg")
+
+# Load the trained models for tumor detection and classification
+tumor_detection_model = tf.keras.models.load_model(os.getenv('MODEL_PATH_DETECTION', './models/Detection_Model.keras'))
+tumor_classification_model = tf.keras.models.load_model(os.getenv('MODEL_PATH_CLASSIFICATION', './models/tumor_classification_model.keras'))
+
+# Define the tumor types (the class labels used during training)
+class_labels = ['glioma', 'meningioma', 'pituitary', 'notumor']
+
+# Define allowed extensions for uploaded files
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# Function to Extract Features from an Image
+def extract_features(image_path):
+    # Use OpenCV to read MRI image (change preprocessing as needed)
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)  # Load as grayscale for MRI scans
+    image = cv2.resize(image, (224, 224))  # Resize to ResNet50 input size
+    image = np.expand_dims(image, axis=-1)  # Add a channel dimension for grayscale image
+    image = np.repeat(image, 3, axis=-1)  # Convert to 3 channels for ResNet50
+
+    # Normalize and preprocess input for ResNet50
+    image = preprocess_input(image.astype(np.float32))  # Normalize for ResNet50
+
+    image = np.expand_dims(image, axis=0)  # Add batch dimension
+    features = resnet_model.predict(image)  # Extract features
+    return features.flatten()  # Flatten to 1D vector
+
+
+# Function to Validate if the Image is in the Dataset
+def validate_image(user_image_path, dataset_features, threshold=0.8):
+    user_features = extract_features(user_image_path)
+
+    # Compute Cosine Similarities with the dataset images
+    similarities = cosine_similarity([user_features], dataset_features)[0]
+
+    # If any similarity score is above the threshold, consider it valid
+    if np.max(similarities) >= threshold:
+        return True, float(np.max(similarities))  # Convert to float for JSON compatibility
+    else:
+        return False, float(np.max(similarities))  # Convert to float for JSON compatibility
+
+
+# Step 1: Extract Features from Dataset Images (Modify this part for your dataset path)
+dataset_path = os.getenv('DATASET_PATH', './validation')  # Default to './validation' if not set
+dataset_features = []
+
+# Extract features from dataset images
+for filename in os.listdir(dataset_path):
+    img_path = os.path.join(dataset_path, filename)
+    features = extract_features(img_path)
+    dataset_features.append(features)
+
+dataset_features = np.array(dataset_features)  # Convert to NumPy array
+
+
+# Function to Predict Tumor Type and Detection
+def predict_tumor_and_type(img_path):
+    # Load and preprocess the image for tumor detection
+    img = image.load_img(img_path, target_size=(224, 224))  # Resize to model input size
+    img_array = image.img_to_array(img) / 255.0  # Convert to array and normalize
+    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
+
+    # Make the tumor detection prediction (binary classification)
+    detection_prediction = tumor_detection_model.predict(img_array)
+
+    if detection_prediction <= 0.5:  # Threshold for binary classification (tumor detected)
+        # If tumor is detected, classify the tumor type
+        classification_prediction = tumor_classification_model.predict(img_array)
+        predicted_class = np.argmax(classification_prediction)  # Get the class with highest probability
+        tumor_type = class_labels[predicted_class]
+        return {"tumor_detected": True, "tumor_type": tumor_type}
+
+    return {"tumor_detected": False, "tumor_type": None}
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')  # A simple HTML form for file upload
+
+
+@app.route('/predict', methods=['POST'])
+def upload_and_predict():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        # Run tumor prediction
+        prediction_result = predict_tumor_and_type(filepath)
+
+        # Run dataset validation
+        is_valid, similarity_score = validate_image(filepath, dataset_features)
+
+        # Return the result after converting numpy types to regular types (e.g., float)
+        result = {
+            "image_url": f"/uploads/{filename}",
+            "tumor_detected": prediction_result["tumor_detected"],
+            "tumor_type": prediction_result["tumor_type"],
+            "is_valid": is_valid,
+            "similarity_score": similarity_score  # Already converted to float
+        }
+
+        return jsonify(result)
+
+    return jsonify({"error": "Invalid file type"}), 400
+
+
+@app.route("/hello")
+def hello_world():
+    """Example Hello World route."""
+    name = os.environ.get("NAME", "World")
+    return f"Hello {name}!"
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host="0.0.0.0", port=app.config['PORT'])
